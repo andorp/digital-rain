@@ -10,16 +10,17 @@ to an ESP32 and rendered as green light.
 
 Follow the numbered STEP sections from top to bottom. The pipeline is:
 
-    /proc counters -> rates -> adaptive activity -> falling particles -> curses
+    /proc process table -> process drops -> deterministic frame -> curses
 
 Try:
     python3 kernel_rain.py
     python3 kernel_rain.py --glyphs katakana --fps 30
     python3 kernel_rain.py --fill --source ebpf  # Fit terminal, resize live
 
-Controls: q quit, space pause animation, r reset learned baselines.
-In --source proc mode glyphs encode /proc changes; in --source ebpf mode
-real sched_switch events (CPU, PIDs, timestamp) drive glyph mutations.
+Controls: q quit, space pause animation, r reset learned baselines and
+process tracking. Each visible drop represents a process. In --source ebpf
+mode real sched_switch events (CPU, PIDs, timestamp) may mutate the matching
+process trail.
 With --fill, terminal width and height determine the simulated grid.
 Each column uses two terminal cells for Japanese glyph alignment; two
 terminal lines are reserved for status. Resizing preserves existing rain.
@@ -29,10 +30,9 @@ terminal lines are reserved for status. Resizing preserves existing rain.
 import argparse
 import curses
 import hashlib
-import os
 import locale
 import math
-import random
+import os
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -153,127 +153,263 @@ class LinuxTelemetry:
         self.previous, self.previous_time = current, now
 
 
-# STEP 6: Define a falling stream. Its head can be fractional so movement
-# stays smooth even when the animation speed is < 1 LED per frame.
+# STEP 6: Read the process table. A process identity includes its start time
+# because Linux can reuse a PID after a process exits.
+@dataclass(frozen=True)
+class ProcessState:
+    pid: int
+    start_time: int
+    name: str
+    state: str
+    cpu_ticks: int
+    cpu_delta: int
+    rss_pages: int
+    threads: int
+
+    @property
+    def identity(self):
+        return self.pid, self.start_time
+
+
+def read_process_table():
+    """Return process snapshots from procfs without requiring root."""
+    processes = {}
+    for path in Path('/proc').glob('[0-9]*/stat'):
+        try:
+            text = path.read_text(encoding='utf-8')
+            close = text.rfind(')')
+            if close < 0:
+                continue
+            pid = int(text[:text.find(' ')])
+            name = text[text.find('(') + 1:close]
+            fields = text[close + 2:].split()
+            # fields starts at stat field 3 (state).
+            processes[(pid, int(fields[19]))] = ProcessState(
+                pid=pid,
+                start_time=int(fields[19]),
+                name=name,
+                state=fields[0],
+                cpu_ticks=int(fields[11]) + int(fields[12]),
+                cpu_delta=0,
+                rss_pages=max(0, int(fields[21])),
+                threads=int(fields[17]),
+            )
+        except (OSError, ValueError, IndexError):
+            # A process can disappear while its stat file is being read.
+            continue
+    return processes
+
+
+class LinuxProcesses:
+    """Turn successive process tables into process activity snapshots."""
+
+    def __init__(self):
+        self.previous = read_process_table()
+        self.thread_owners = {}
+
+    def sample(self, include_threads=False):
+        current = read_process_table()
+        result = {}
+        owners = {}
+        for identity, process in current.items():
+            previous = self.previous.get(identity)
+            delta = max(0, process.cpu_ticks - previous.cpu_ticks) if previous else 0
+            result[identity] = ProcessState(
+                pid=process.pid,
+                start_time=process.start_time,
+                name=process.name,
+                state=process.state,
+                cpu_ticks=process.cpu_ticks,
+                cpu_delta=delta,
+                rss_pages=process.rss_pages,
+                threads=process.threads,
+            )
+            if include_threads:
+                try:
+                    for task in Path(f'/proc/{process.pid}/task').iterdir():
+                        owners[int(task.name)] = identity
+                except (OSError, ValueError):
+                    pass
+        self.thread_owners = owners
+        self.previous = current
+        return result
+
+
+# STEP 7: A drop is a visual projection of one process. Its head can be
+# fractional so movement stays smooth even when speed is < 1 LED per frame.
 @dataclass
 class Drop:
+    process: ProcessState
     head: float
     speed: float                 # LED cells per second
-    glyphs: list[str]           # Persistent glyph for every trail position
+    glyphs: list[str]            # Deterministic glyph for every trail position
+    active: bool = True
+    fade: float = 1.0
+    entry_delay: float = 0.0
+    entered: bool = True
 
     @property
     def length(self):
         return len(self.glyphs)
 
 
-# STEP 7: Simulation is independent of the terminal renderer.
-# A future LED backend can consume the same pixels() result.
+# STEP 8: Simulation is independent of the terminal renderer.
 class RainSimulation:
     def __init__(self, columns, rows, glyphs, seed=None):
         self.columns, self.rows = columns, rows
         self.glyphs = glyphs
-        self.rng = random.Random(seed)
+        self.seed = seed if seed is not None else 0
         self.drops = [[] for _ in range(columns)]
+        self.process_drops = {}
+        self.process_columns = {}
+        self.startup_duration = 5.0
+        self.started_columns = set()
+        self.column_wait = [0.0] * columns
+        self.clock_ticks = os.sysconf('SC_CLK_TCK')
 
     def resize(self, columns, rows):
-        """Adapt to terminal resize without resetting the active animation.
-
-        Existing columns retain their drops. New columns start empty; drops
-        naturally expire if the terminal becomes shorter.
-        """
-        if columns > self.columns:
-            self.drops.extend([] for _ in range(columns - self.columns))
-        else:
-            del self.drops[columns:]
+        """Adapt to terminal resize without resetting active animation."""
+        old = self.drops
+        self.drops = [[] for _ in range(columns)]
+        for x, queue in enumerate(old):
+            for drop in queue:
+                target = x % columns
+                if self.drops[target] and drop.entered:
+                    # A merged column has one visible stream. Resume the
+                    # displaced stream from the top when its turn comes.
+                    drop.entered = False
+                    drop.head = -1.0
+                self.drops[target].append(drop)
+                self.process_columns[drop.process.identity] = target
+        self.column_wait = (self.column_wait + [0.0] * columns)[:columns]
+        self.started_columns = {x for x in self.started_columns if x < columns}
         self.columns, self.rows = columns, rows
 
-    def step(self, dt, intensity):
+    def _column_for(self, identity):
+        """Place new processes in the least populated column."""
+        if identity in self.process_columns:
+            return self.process_columns[identity] % self.columns
+        payload = f'{identity[0]}:{identity[1]}:{self.seed}'.encode('ascii')
+        start = int.from_bytes(hashlib.blake2s(payload, digest_size=8).digest(), 'big') % self.columns
+        count = min(map(len, self.drops))
+        column = next((start + offset) % self.columns for offset in range(self.columns)
+                      if len(self.drops[(start + offset) % self.columns]) == count)
+        self.process_columns[identity] = column
+        return column
+
+    def _glyphs_for(self, process, length):
+        """Create stable artwork from process identity and trail position."""
+        result = []
+        for distance in range(length):
+            payload = (f'{process.pid}:{process.start_time}:{process.name}:'
+                       f'{distance}:{self.seed}').encode('utf-8', 'replace')
+            value = int.from_bytes(
+                hashlib.blake2s(payload, digest_size=8).digest(), 'big')
+            result.append(self.glyphs[value % len(self.glyphs)])
+        return result
+
+    def _trail_length(self, process):
+        # Shape currently reflects memory/thread count; glyph meanings come in
+        # the next phase.
+        memory_part = min(8, int(math.log2(process.rss_pages + 1)))
+        thread_part = min(4, max(0, process.threads - 1))
+        return max(5, min(16, 5 + memory_part + thread_part))
+
+    def _startup_delay(self, identity):
+        payload = f'start:{identity[0]}:{identity[1]}:{self.seed}'.encode('ascii')
+        value = int.from_bytes(hashlib.blake2s(payload, digest_size=8).digest(), 'big')
+        return (value / (2**64 - 1)) * self.startup_duration
+
+    def sync_processes(self, processes, elapsed):
+        """Track every process while keeping each column's queue stable."""
+        current = sorted(processes.values(), key=lambda process: process.identity)
+        live = {process.identity for process in current}
+        for identity, drop in self.process_drops.items():
+            if identity not in live:
+                drop.active = False
+        for process in current:
+            identity = process.identity
+            drop = self.process_drops.get(identity)
+            if drop is None:
+                length = self._trail_length(process)
+                drop = Drop(
+                    process, -1.0, 3.0, self._glyphs_for(process, length),
+                    entered=False,
+                )
+                self.process_drops[identity] = drop
+                self.drops[self._column_for(identity)].append(drop)
+            else:
+                drop.process = process
+                drop.active = True
+                drop.fade = 1.0
+            # /proc CPU time is in clock ticks; use it to control motion.
+            cpu_rate = process.cpu_delta / max(elapsed * self.clock_ticks, 0.001)
+            drop.speed = 8.0 + 12.0 * clamp(cpu_rate)
+
+    def step(self, dt, intensity=None):
         for x in range(self.columns):
-            # Assign six columns to each of the five telemetry channels.
-            channel = CHANNELS[x % len(CHANNELS)]
-            activity = intensity[channel]
-            # Poisson spawning: probability of >=1 arrival in interval dt.
-            arrivals_per_second = 0.07 + 1.6 * activity
-            chance = 1.0 - math.exp(-arrivals_per_second * dt)
-            if len(self.drops[x]) < 3 and self.rng.random() < chance:
-                trail_length = self.rng.randint(5, 13)
-                speed = self.rng.uniform(5, 11) * (0.7 + 1.5 * activity)
-                chars = [self.rng.choice(self.glyphs) for _ in range(trail_length)]
-                self.drops[x].append(Drop(-1.0, speed, chars))
-            alive = []
-            for drop in self.drops[x]:
-                drop.head += drop.speed * dt
-                # Glyphs are NOT mutated here: movement and mutation use
-                # independent clocks. See apply_telemetry() below.
-                if drop.head - drop.length < self.rows:
-                    alive.append(drop)
-            self.drops[x] = alive
-
-    def apply_telemetry(self, telemetry):
-        """Mutate tail glyphs from measured kernel counter deltas.
-
-        The input is a sampled /proc snapshot, not a synthetic random event.
-        Each channel has a cumulative counter and a delta since last sample.
-        We only mutate when that channel's counter actually changes.
-
-        BLAKE2s provides a reproducible mapping from numeric measurements
-        to glyphs. Including column, drop position and sample number makes
-        different trail cells display different characters, even when they
-        react to the same underlying kernel observation.
-
-        This is a *visual encoding*, not a reversible record of kernel events.
-        For actual per-process identity, a later version needs eBPF tracepoints.
-        """
-        for x, drops in enumerate(self.drops):
-            channel = CHANNELS[x % len(CHANNELS)]
-            delta, cumulative = telemetry.event_data[channel]
-            if delta <= 0:
-                continue  # No new measured activity: no glyph mutation.
-            for drop_number, drop in enumerate(drops):
-                for distance in range(drop.length):
-                    # More activity changes more cells, but no random choice.
-                    # The threshold uses a bounded, deterministic activity
-                    # score. Even the tail can change when data arrives.
-                    activity = clamp(math.log1p(delta) / 12.0)
-                    payload = (f'{channel}:{delta}:{cumulative}:'
-                               f'{telemetry.sample_index}:{x}:'
-                               f'{drop_number}:{distance}').encode('ascii')
-                    digest = hashlib.blake2s(payload, digest_size=8).digest()
-                    value = int.from_bytes(digest, 'big')
-                    if value % 10000 < int((0.15 + 0.85 * activity) * 10000):
-                        drop.glyphs[distance] = self.glyphs[
-                            (value // 10000) % len(self.glyphs)]
-
-    def apply_schedule_events(self, events):
-        """Map *actual* sched_switch records to trail mutations.
-
-        CPU identity selects the column, PID identity selects the trail cell,
-        and timestamp + PIDs select a reproducible glyph. Unlike polling
-        /proc, these are individual kernel events. Every visible trail cell
-        can change, not only its head. The cap is enforced by the caller.
-        """
-        for event in events:
-            x = (event.cpu * 7 + event.next_pid) % self.columns
-            drops = self.drops[x]
-            if not drops:
+            queue = self.drops[x]
+            if not queue:
                 continue
-            drop = drops[event.next_pid % len(drops)]
-            distance = (event.prev_pid ^ event.next_pid ^ (event.timestamp_ns >> 12)) % drop.length
+            drop = queue[0]
+            if not drop.entered:
+                if x not in self.started_columns:
+                    self.column_wait[x] = self._startup_delay(drop.process.identity)
+                    self.started_columns.add(x)
+                self.column_wait[x] = max(0.0, self.column_wait[x] - dt)
+                if self.column_wait[x] > 0.0:
+                    continue
+                drop.entered = True
+            drop.head += drop.speed * dt
+            if not drop.active:
+                drop.fade *= math.exp(-dt / 0.8)
+                # A process that exited while waiting still gets one brief
+                # visible pass; fading begins when it enters the column.
+            if drop.head - drop.length >= self.rows:
+                queue.pop(0)
+                if drop.active:
+                    drop.head = -1.0
+                    drop.entered = False
+                    queue.append(drop)
+                else:
+                    self.process_drops.pop(drop.process.identity, None)
+                    self.process_columns.pop(drop.process.identity, None)
+                self.column_wait[x] = 0.4 + self._startup_delay(drop.process.identity) / 6.0
+
+    def apply_schedule_events(self, events, thread_owners=None):
+        """Use scheduler events to mutate the matching process trail."""
+        by_pid = {drop.process.pid: drop for drop in self.process_drops.values()
+                  if drop.active}
+        for event in events:
+            identity = thread_owners.get(event.next_pid) if thread_owners else None
+            drop = (self.process_drops.get(identity) if identity else
+                    by_pid.get(event.next_pid))
+            if drop is None or not drop.active:
+                continue
+            distance = (event.prev_pid ^ event.next_pid ^
+                        (event.timestamp_ns >> 12)) % drop.length
             payload = (f'{event.cpu}:{event.prev_pid}:{event.next_pid}:'
                        f'{event.timestamp_ns}').encode('ascii')
-            value = int.from_bytes(hashlib.blake2s(payload, digest_size=8).digest(), 'big')
+            value = int.from_bytes(
+                hashlib.blake2s(payload, digest_size=8).digest(), 'big')
             drop.glyphs[distance] = self.glyphs[value % len(self.glyphs)]
 
     def pixels(self):
         """Return grid[row][column] = (glyph, brightness tier 0..3)."""
         grid = [[(' ', 0) for _ in range(self.columns)] for _ in range(self.rows)]
         for x, drops in enumerate(self.drops):
-            for drop in drops:
+            for drop in drops[:1]:
+                if not drop.entered:
+                    continue
                 for distance, glyph in enumerate(drop.glyphs):
                     y = int(drop.head) - distance
                     if 0 <= y < self.rows:
                         fraction = distance / drop.length
                         tier = 3 if distance == 0 else (2 if fraction < 0.45 else 1)
+                        if drop.fade < 0.75:
+                            tier -= 1
+                        if drop.fade < 0.25:
+                            tier = 0
                         if tier >= grid[y][x][1]:
                             grid[y][x] = (glyph, tier)
         return grid
@@ -283,15 +419,22 @@ class RainSimulation:
 # drawing. Wide Unicode characters require a UTF-8 locale and suitable font.
 def draw(stdscr, simulation, telemetry, paused, ebpf_status=""):
     height, width = stdscr.getmaxyx()
-    stdscr.erase()
+    try:
+        stdscr.erase()
+    except curses.error:
+        return
     needed_width = simulation.columns * 2
     if width < needed_width or height < 3:
         message = f'Enlarge terminal: width >= {needed_width}, height >= 4'
-        stdscr.addnstr(0, 0, message, max(0, width - 1))
-        stdscr.refresh()
+        if height > 0 and width > 1:
+            try:
+                stdscr.addnstr(0, 0, message, width - 1)
+                stdscr.refresh()
+            except curses.error:
+                pass
         return
 
-    visible_rows = min(simulation.rows, height - 3)
+    visible_rows = min(simulation.rows, height - 2)
     for y, row in enumerate(simulation.pixels()[:visible_rows]):
         for x, (glyph, brightness) in enumerate(row):
             if brightness == 0:
@@ -310,19 +453,29 @@ def draw(stdscr, simulation, telemetry, paused, ebpf_status=""):
             except curses.error:
                 pass  # Bottom/right edge behaviour varies by terminal.
 
+    active_processes = sum(
+        1 for drop in simulation.process_drops.values() if drop.active
+    )
     info = (f'CPU {telemetry.intensity["cpu"]*100:3.0f}% | '
+            f'proc {active_processes:3d} | '
             f'switch {telemetry.rates["switches"]:,.0f}/s | '
             f'fork {telemetry.rates["forks"]:,.0f}/s | '
             f'disk {telemetry.rates["disk"]/1e6:.1f} MB/s | '
             f'net {telemetry.rates["net"]/1e6:.1f} MB/s')
-    stdscr.addnstr(height - 2, 0, info, max(0, width - 1))
+    try:
+        stdscr.addnstr(height - 2, 0, info, max(0, width - 1))
+    except curses.error:
+        pass
     footer = f'{simulation.columns}x{simulation.rows} LEDs | q quit | space pause | r relearn'
     if ebpf_status:
         footer += ' | ' + ebpf_status
     if paused:
         footer += ' | PAUSED'
-    stdscr.addnstr(height - 1, 0, footer, max(0, width - 1))
-    stdscr.refresh()
+    try:
+        stdscr.addnstr(height - 1, 0, footer, max(0, width - 1))
+        stdscr.refresh()
+    except curses.error:
+        pass
 
 
 # STEP 9: Main loop. Telemetry is sampled slowly; animation runs more often.
@@ -356,6 +509,7 @@ def run(stdscr, args):
     columns, rows = terminal_grid() if args.fill else (args.columns, args.rows)
     rain = RainSimulation(columns, rows, glyphs, args.seed)
     telemetry = LinuxTelemetry()
+    processes = LinuxProcesses()
     collector = None
     if args.source == 'ebpf':
         from ebpf_events import SchedulerCollector
@@ -383,19 +537,20 @@ def run(stdscr, args):
             paused = not paused
         if key == ord('r'):
             telemetry = LinuxTelemetry()
+            processes = LinuxProcesses()
             next_poll = frame_start + args.poll
         if frame_start >= next_poll:
             try:
                 telemetry.sample()
-                if not paused and collector is None:
-                    rain.apply_telemetry(telemetry)
+                process_snapshot = processes.sample(include_threads=collector is not None)
+                rain.sync_processes(process_snapshot, args.poll)
             except (OSError, ValueError, IndexError):
                 pass  # Keep rendering if a transient procfs read fails.
             next_poll = frame_start + args.poll
         if collector is not None:
             events, lost = collector.drain(max_items=args.max_events_per_frame)
             if not paused:
-                rain.apply_schedule_events(events)
+                rain.apply_schedule_events(events, processes.thread_owners)
             ebpf_status = f'eBPF sched_switch {len(events)}/frame dropped {lost}'
             if collector.error:
                 ebpf_status = 'eBPF ERROR: ' + collector.error

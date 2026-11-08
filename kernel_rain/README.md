@@ -1,6 +1,6 @@
 # Kernel Rain
 
-A Linux-only, standard-library Python curses simulator of a 30-column × 60-pixel green LED rain wall. It samples read-only `/proc` counters and learns rolling baselines for context switches, forks, disk and network rates. CPU utilisation drives additional activity. No root privileges, eBPF, or third-party packages are required.
+A Linux-only, standard-library Python curses simulator of a 30-column × 60-pixel green LED rain wall. Visible drops represent real processes discovered through read-only `/proc`. Process identity deterministically selects a trail, CPU activity controls its speed, and memory/thread state affects its length. No root privileges, eBPF, or third-party packages are required for the default mode.
 
 ## Run
 
@@ -20,21 +20,25 @@ Controls: `q` or Escape quits, Space pauses, `r` resets adaptive baselines.
 
 ## Mapping
 
-Columns repeat five telemetry channels: CPU utilisation, context switches, forks, disk throughput and network throughput. Each has a minimum ambient spawn rate, with additional activity derived from measurements. Bright heads, fading trails and glyph mutation are animated locally. `/proc/pressure/memory` is sampled and displayed but not yet mapped to rain.
+Every discovered process has a drop, assigned to a column with the fewest queued processes. Each column shows one stream at a time and cycles through its queue as streams finish. Initial column entries are staggered, and a short gap separates successive streams. A process receives a stable column and deterministic glyph trail based on its PID, start time and executable name. A terminated process that is already visible continues falling and fades; a live process returns to its column queue after reaching the bottom. The status line also reports aggregate CPU, context-switch, fork, disk and network activity.
 
 ## Caveats
 
 `forks` comes from the cumulative Linux `processes` counter (process/thread creations), not executable launches. Disk throughput uses whole-device sector counters and may miss some device types. Network counters are from the current network namespace. Baselines use exponentially weighted mean and variance of log-rates; the system adapts over approximately 45 seconds and is not an ML model. Unicode terminal cells are not physical LEDs; the eventual LED backend should consume brightness tiers instead of glyphs.
 
-## Data-driven glyph mutation
+## Process-backed visualisation
 
-Glyph mutation happens only after a successful `/proc` telemetry sample, and
-only for channels whose kernel counter increased. The `apply_telemetry` method
-uses BLAKE2s to map counter deltas, cumulative values, sample number, column,
-and trail position to glyph choices. This is deterministic for the same input,
-not an independently random mutation timer. Stream spawning and initial glyphs
-remain pseudorandom to preserve an organic visual layout. This version uses
-aggregated counters; per-process scheduling events require a future eBPF collector.
+Each drop is backed by a `(PID, process start time)` identity, so PID reuse does
+not accidentally continue an old process's visual stream. The first visual
+phase intentionally gives glyphs stable identity rather than semantic meaning.
+The next phase can encode process state, executable names, scheduler state and
+other fields into the glyphs without changing the renderer or lifecycle model.
+
+The process table is sampled periodically. Every discovered process joins a
+column queue, though only the first stream in each column is drawn at a time.
+With more processes than columns, each process appears in turn rather than all
+at once. The display remains an intuition-building view rather than an exact
+process monitor.
 
 ## Real scheduler events via eBPF (optional)
 
@@ -56,7 +60,7 @@ Kernel headers package availability depends on the installed kernel; BCC may wor
 
 ### How event-driven mutation works
 
-`ebpf_events.py` contains a small C eBPF program attached to `sched:sched_switch`. It sends timestamp, CPU, previous PID and next PID to a bounded Python queue through a BPF perf buffer. A background thread polls the perf buffer. The curses loop drains up to `--max-events-per-frame` events per frame and maps them deterministically to column, tail position and glyph. No command lines or process names are captured.
+`ebpf_events.py` contains a small C eBPF program attached to `sched:sched_switch`. It sends timestamp, CPU, previous PID and next PID to a bounded Python queue through a BPF perf buffer. A background thread polls the perf buffer. The curses loop drains up to `--max-events-per-frame` events per frame and applies them to the matching visible process trail. No command lines or process names are captured.
 
 `--source proc` remains the default for compatibility and as a fallback. If BCC is missing or tracepoint attachment is denied, eBPF mode reports an error instead of silently claiming to show real scheduler events.
 
