@@ -33,6 +33,7 @@ import hashlib
 import locale
 import math
 import os
+import random
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -48,6 +49,23 @@ GLYPHS = {
     'ascii': '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ@#$%&*+',
 }
 CHANNELS = ('cpu', 'switches', 'forks', 'disk', 'net')
+SEMANTIC_SLOTS = 6  # Head first: state, CPU, memory, I/O, threads, pressure.
+# Each tuple preserves one meaning across kanji, hiragana, katakana, ASCII.
+# Kana are single-character reading cues; ASCII is a slot-specific mnemonic.
+SYMBOLS = {
+    '走': ('走', 'そ', 'ソ', 'R'), '眠': ('眠', 'み', 'ミ', 'S'),
+    '待': ('待', 'ま', 'マ', 'D'), '止': ('止', 'と', 'ト', 'T'),
+    '終': ('終', 'し', 'シ', 'Z'), '不': ('不', 'ふ', 'フ', '?'),
+    '静': ('静', 'せ', 'セ', '0'), '低': ('低', 'て', 'テ', 'L'),
+    '中': ('中', 'ち', 'チ', 'M'), '高': ('高', 'こ', 'コ', 'H'),
+    '増': ('増', 'ぞ', 'ゾ', '+'), '減': ('減', 'げ', 'ゲ', '-'),
+    '定': ('定', 'じ', 'ジ', '='), '無': ('無', 'む', 'ム', '0'),
+    '読': ('読', 'よ', 'ヨ', 'R'), '書': ('書', 'か', 'カ', 'W'),
+    '双': ('双', 'そ', 'ソ', 'B'), '算': ('算', 'さ', 'サ', 'C'),
+    '憶': ('憶', 'お', 'オ', 'M'), '入': ('入', 'に', 'ニ', 'I'),
+    '生': ('生', 'せ', 'セ', 'N'), '散': ('散', 'さ', 'サ', 'X'),
+    '切': ('切', 'き', 'キ', 'S'),
+}
 
 
 def clamp(x, low=0.0, high=1.0):
@@ -165,6 +183,12 @@ class ProcessState:
     cpu_delta: int
     rss_pages: int
     threads: int
+    memory_delta: int = 0
+    thread_delta: int = 0
+    read_bytes: int | None = None
+    write_bytes: int | None = None
+    read_delta: int = 0
+    write_delta: int = 0
 
     @property
     def identity(self):
@@ -183,6 +207,13 @@ def read_process_table():
             pid = int(text[:text.find(' ')])
             name = text[text.find('(') + 1:close]
             fields = text[close + 2:].split()
+            try:
+                io = dict(line.split(':', 1) for line in
+                          Path(f'/proc/{pid}/io').read_text(encoding='ascii').splitlines())
+                read_bytes = int(io['read_bytes'])
+                write_bytes = int(io['write_bytes'])
+            except (OSError, KeyError, ValueError):
+                read_bytes = write_bytes = None
             # fields starts at stat field 3 (state).
             processes[(pid, int(fields[19]))] = ProcessState(
                 pid=pid,
@@ -193,6 +224,8 @@ def read_process_table():
                 cpu_delta=0,
                 rss_pages=max(0, int(fields[21])),
                 threads=int(fields[17]),
+                read_bytes=read_bytes,
+                write_bytes=write_bytes,
             )
         except (OSError, ValueError, IndexError):
             # A process can disappear while its stat file is being read.
@@ -223,6 +256,14 @@ class LinuxProcesses:
                 cpu_delta=delta,
                 rss_pages=process.rss_pages,
                 threads=process.threads,
+                memory_delta=process.rss_pages - previous.rss_pages if previous else 0,
+                thread_delta=process.threads - previous.threads if previous else 0,
+                read_bytes=process.read_bytes,
+                write_bytes=process.write_bytes,
+                read_delta=max(0, process.read_bytes - previous.read_bytes)
+                if previous and process.read_bytes is not None and previous.read_bytes is not None else 0,
+                write_delta=max(0, process.write_bytes - previous.write_bytes)
+                if previous and process.write_bytes is not None and previous.write_bytes is not None else 0,
             )
             if include_threads:
                 try:
@@ -233,6 +274,22 @@ class LinuxProcesses:
         self.thread_owners = owners
         self.previous = current
         return result
+
+
+def read_system_pressure():
+    """Return the strongest recent system stall, or unknown if unavailable."""
+    levels = {}
+    for resource in ('cpu', 'memory', 'io'):
+        try:
+            line = Path(f'/proc/pressure/{resource}').read_text(encoding='ascii').splitlines()[0]
+            fields = dict(part.split('=', 1) for part in line.split()[1:])
+            levels[resource] = float(fields['avg10'])
+        except (OSError, IndexError, KeyError, ValueError):
+            continue
+    if not levels:
+        return None
+    resource = max(levels, key=levels.get)
+    return resource if levels[resource] >= 5.0 else 'quiet'
 
 
 # STEP 7: A drop is a visual projection of one process. Its head can be
@@ -247,6 +304,12 @@ class Drop:
     fade: float = 1.0
     entry_delay: float = 0.0
     entered: bool = True
+    semantic_keys: list[str] | None = None
+    change_times: list[float] | None = None
+    symbol_rng: random.Random | None = None
+    sustained_activity: float = 0.0
+    length_elapsed: float = 0.0
+    scheduler_events: int = 0
 
     @property
     def length(self):
@@ -297,30 +360,108 @@ class RainSimulation:
         self.process_columns[identity] = column
         return column
 
-    def _glyphs_for(self, process, length):
-        """Create stable artwork from process identity and trail position."""
-        result = []
-        for distance in range(length):
-            payload = (f'{process.pid}:{process.start_time}:{process.name}:'
-                       f'{distance}:{self.seed}').encode('utf-8', 'replace')
-            value = int.from_bytes(
-                hashlib.blake2s(payload, digest_size=8).digest(), 'big')
-            result.append(self.glyphs[value % len(self.glyphs)])
-        return result
-
     def _trail_length(self, process):
-        # Shape currently reflects memory/thread count; glyph meanings come in
-        # the next phase.
-        memory_part = min(8, int(math.log2(process.rss_pages + 1)))
-        thread_part = min(4, max(0, process.threads - 1))
-        return max(5, min(16, 5 + memory_part + thread_part))
+        # A logarithmic memory scale keeps large processes from filling the
+        # entire tail. Leave room for a temporary sustained-activity extension.
+        memory_part = min(6, int(math.log2(process.rss_pages + 1) / 2))
+        thread_part = min(3, int(math.log2(max(1, process.threads))))
+        return min(16, SEMANTIC_SLOTS + memory_part + thread_part)
+
+    def _adjust_length(self, drop, process, elapsed):
+        """Move toward a memory/thread/activity target one tail cell at a time."""
+        cpu = clamp(process.cpu_delta / max(elapsed * self.clock_ticks, 0.001))
+        io_bytes = process.read_delta + process.write_delta
+        io = clamp(math.log1p(io_bytes / max(elapsed, 0.001)) / math.log1p(1_000_000))
+        activity = max(cpu, io)
+        alpha = 1.0 - math.exp(-elapsed / 4.0)
+        drop.sustained_activity += alpha * (activity - drop.sustained_activity)
+        target = min(16, self._trail_length(process) + round(3 * drop.sustained_activity))
+        drop.length_elapsed = min(0.4, drop.length_elapsed + elapsed)
+        if drop.length_elapsed < 0.4 or target == drop.length:
+            return
+        drop.length_elapsed = 0.0
+        if target > drop.length:
+            drop.glyphs.append(' ')
+        else:
+            drop.glyphs.pop()
+
+    def _record_history(self, drop, process, elapsed):
+        """Push one observed activity class behind the six current-state cells."""
+        if drop.length <= SEMANTIC_SLOTS:
+            drop.scheduler_events = 0
+            return
+        cpu = process.cpu_delta / max(elapsed * self.clock_ticks, 0.001)
+        read_rate = process.read_delta / max(elapsed, 0.001)
+        write_rate = process.write_delta / max(elapsed, 0.001)
+        candidates = [
+            (cpu if cpu >= 0.01 else 0.0, '算'),
+            (clamp(read_rate / 1_000_000), '読'),
+            (clamp(write_rate / 1_000_000), '書'),
+            (clamp(process.memory_delta / 256), '増'),
+            (clamp(-process.memory_delta / 256), '減'),
+            (1.0 if process.thread_delta > 0 else 0.0, '生'),
+            (1.0 if process.thread_delta < 0 else 0.0, '散'),
+            (0.25 if drop.scheduler_events else 0.0, '切'),
+        ]
+        score, key = max(candidates, key=lambda item: item[0])
+        drop.scheduler_events = 0
+        if score == 0:
+            key = '静'
+        drop.glyphs.insert(SEMANTIC_SLOTS, drop.symbol_rng.choice(SYMBOLS[key]))
+        drop.glyphs.pop()  # Oldest sample falls off the far end.
+
+    def _semantic_glyphs(self, process, elapsed, pressure):
+        state = {'R': '走', 'S': '眠', 'D': '待', 'T': '止', 't': '止',
+                 'Z': '終', 'X': '終', 'I': '眠'}.get(process.state, '不')
+        cpu = process.cpu_delta / max(elapsed * self.clock_ticks, 0.001)
+        cpu_glyph = '静' if cpu < 0.01 else '低' if cpu < 0.1 else '中' if cpu < 0.5 else '高'
+        memory = '増' if process.memory_delta > 16 else '減' if process.memory_delta < -16 else '定'
+        if process.read_bytes is None or process.write_bytes is None:
+            io = '不'
+        elif process.read_delta and process.write_delta:
+            io = '双'
+        elif process.read_delta:
+            io = '読'
+        elif process.write_delta:
+            io = '書'
+        else:
+            io = '無'
+        threads = '増' if process.thread_delta > 0 else '減' if process.thread_delta < 0 else '定'
+        system = {None: '不', 'quiet': '静', 'cpu': '算',
+                  'memory': '憶', 'io': '入'}[pressure]
+        return [state, cpu_glyph, memory, io, threads, system]
+
+    def _update_symbols(self, drop, keys):
+        if drop.symbol_rng is None:
+            payload = f'symbols:{drop.process.pid}:{drop.process.start_time}:{self.seed}'.encode('ascii')
+            value = int.from_bytes(hashlib.blake2s(payload, digest_size=8).digest(), 'big')
+            drop.symbol_rng = random.Random(value)
+            drop.semantic_keys = list(keys)
+            drop.change_times = [drop.symbol_rng.uniform(0.5, 2.5)
+                                 for _ in range(SEMANTIC_SLOTS)]
+            for i, key in enumerate(keys):
+                drop.glyphs[i] = drop.symbol_rng.choice(SYMBOLS[key])
+            return
+        for i, key in enumerate(keys):
+            if key != drop.semantic_keys[i]:
+                drop.semantic_keys[i] = key
+                drop.glyphs[i] = drop.symbol_rng.choice(SYMBOLS[key])
+                drop.change_times[i] = drop.symbol_rng.uniform(0.5, 2.5)
+
+    def _animate_symbols(self, drop, dt):
+        for i, key in enumerate(drop.semantic_keys):
+            drop.change_times[i] -= dt
+            if drop.change_times[i] <= 0:
+                choices = [glyph for glyph in SYMBOLS[key] if glyph != drop.glyphs[i]]
+                drop.glyphs[i] = drop.symbol_rng.choice(choices)
+                drop.change_times[i] = drop.symbol_rng.uniform(0.5, 2.5)
 
     def _startup_delay(self, identity):
         payload = f'start:{identity[0]}:{identity[1]}:{self.seed}'.encode('ascii')
         value = int.from_bytes(hashlib.blake2s(payload, digest_size=8).digest(), 'big')
         return (value / (2**64 - 1)) * self.startup_duration
 
-    def sync_processes(self, processes, elapsed):
+    def sync_processes(self, processes, elapsed, pressure=None):
         """Track every process while keeping each column's queue stable."""
         current = sorted(processes.values(), key=lambda process: process.identity)
         live = {process.identity for process in current}
@@ -333,7 +474,7 @@ class RainSimulation:
             if drop is None:
                 length = self._trail_length(process)
                 drop = Drop(
-                    process, -1.0, 3.0, self._glyphs_for(process, length),
+                    process, -1.0, 3.0, [' '] * length,
                     entered=False,
                 )
                 self.process_drops[identity] = drop
@@ -342,6 +483,9 @@ class RainSimulation:
                 drop.process = process
                 drop.active = True
                 drop.fade = 1.0
+            self._update_symbols(drop, self._semantic_glyphs(process, elapsed, pressure))
+            self._adjust_length(drop, process, elapsed)
+            self._record_history(drop, process, elapsed)
             # /proc CPU time is in clock ticks; use it to control motion.
             cpu_rate = process.cpu_delta / max(elapsed * self.clock_ticks, 0.001)
             drop.speed = 8.0 + 12.0 * clamp(cpu_rate)
@@ -361,6 +505,7 @@ class RainSimulation:
                     continue
                 drop.entered = True
             drop.head += drop.speed * dt
+            self._animate_symbols(drop, dt)
             if not drop.active:
                 drop.fade *= math.exp(-dt / 0.8)
                 # A process that exited while waiting still gets one brief
@@ -377,7 +522,7 @@ class RainSimulation:
                 self.column_wait[x] = 0.4 + self._startup_delay(drop.process.identity) / 6.0
 
     def apply_schedule_events(self, events, thread_owners=None):
-        """Use scheduler events to mutate the matching process trail."""
+        """Count matching scheduler events for the next history sample."""
         by_pid = {drop.process.pid: drop for drop in self.process_drops.values()
                   if drop.active}
         for event in events:
@@ -386,13 +531,7 @@ class RainSimulation:
                     by_pid.get(event.next_pid))
             if drop is None or not drop.active:
                 continue
-            distance = (event.prev_pid ^ event.next_pid ^
-                        (event.timestamp_ns >> 12)) % drop.length
-            payload = (f'{event.cpu}:{event.prev_pid}:{event.next_pid}:'
-                       f'{event.timestamp_ns}').encode('ascii')
-            value = int.from_bytes(
-                hashlib.blake2s(payload, digest_size=8).digest(), 'big')
-            drop.glyphs[distance] = self.glyphs[value % len(self.glyphs)]
+            drop.scheduler_events += 1
 
     def pixels(self):
         """Return grid[row][column] = (glyph, brightness tier 0..3)."""
@@ -402,6 +541,8 @@ class RainSimulation:
                 if not drop.entered:
                     continue
                 for distance, glyph in enumerate(drop.glyphs):
+                    if glyph == ' ':
+                        continue
                     y = int(drop.head) - distance
                     if 0 <= y < self.rows:
                         fraction = distance / drop.length
@@ -543,7 +684,7 @@ def run(stdscr, args):
             try:
                 telemetry.sample()
                 process_snapshot = processes.sample(include_threads=collector is not None)
-                rain.sync_processes(process_snapshot, args.poll)
+                rain.sync_processes(process_snapshot, args.poll, read_system_pressure())
             except (OSError, ValueError, IndexError):
                 pass  # Keep rendering if a transient procfs read fails.
             next_poll = frame_start + args.poll
