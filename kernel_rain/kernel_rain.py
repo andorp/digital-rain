@@ -18,9 +18,8 @@ Try:
     python3 kernel_rain.py --fill --source ebpf  # Fit terminal, resize live
 
 Controls: q quit, space pause animation, r reset learned baselines and
-process tracking. Each visible drop represents a process. In --source ebpf
-mode real sched_switch events (CPU, PIDs, timestamp) may mutate the matching
-process trail.
+process sampling. Each visible drop represents a process. In --source ebpf
+mode real sched_switch events contribute to the matching process's history.
 With --fill, terminal width and height determine the simulated grid.
 Each column uses two terminal cells for Japanese glyph alignment; two
 terminal lines are reserved for status. Resizing preserves existing rain.
@@ -238,10 +237,14 @@ class LinuxProcesses:
 
     def __init__(self):
         self.previous = read_process_table()
+        self.previous_time = time.monotonic()
+        self.elapsed = 0.2
         self.thread_owners = {}
 
     def sample(self, include_threads=False):
+        now = time.monotonic()
         current = read_process_table()
+        self.elapsed = max(now - self.previous_time, 0.001)
         result = {}
         owners = {}
         for identity, process in current.items():
@@ -273,23 +276,25 @@ class LinuxProcesses:
                     pass
         self.thread_owners = owners
         self.previous = current
+        self.previous_time = now
         return result
 
 
 def read_system_pressure():
-    """Return the strongest recent system stall, or unknown if unavailable."""
+    """Return strongest recent stall and its cumulative stall microseconds."""
     levels = {}
     for resource in ('cpu', 'memory', 'io'):
         try:
             line = Path(f'/proc/pressure/{resource}').read_text(encoding='ascii').splitlines()[0]
             fields = dict(part.split('=', 1) for part in line.split()[1:])
-            levels[resource] = float(fields['avg10'])
+            levels[resource] = (float(fields['avg10']), int(fields['total']))
         except (OSError, IndexError, KeyError, ValueError):
             continue
     if not levels:
-        return None
-    resource = max(levels, key=levels.get)
-    return resource if levels[resource] >= 5.0 else 'quiet'
+        return None, 0
+    resource = max(levels, key=lambda name: levels[name][0])
+    label = resource if levels[resource][0] >= 5.0 else 'quiet'
+    return label, sum(total for _, total in levels.values())
 
 
 # STEP 7: A drop is a visual projection of one process. Its head can be
@@ -302,14 +307,20 @@ class Drop:
     glyphs: list[str]            # Deterministic glyph for every trail position
     active: bool = True
     fade: float = 1.0
-    entry_delay: float = 0.0
     entered: bool = True
     semantic_keys: list[str] | None = None
-    change_times: list[float] | None = None
+    symbol_offsets: list[int] | None = None
+    previous_levels: tuple[int, ...] | None = None
+    heartbeat_progress: list[int] | None = None
+    heartbeat_cadences: list[int] | None = None
     symbol_rng: random.Random | None = None
     sustained_activity: float = 0.0
     length_elapsed: float = 0.0
     scheduler_events: int = 0
+    scheduler_total: int = 0
+    state_transitions: int = 0
+    memory_movement: int = 0
+    thread_movement: int = 0
 
     @property
     def length(self):
@@ -318,9 +329,13 @@ class Drop:
 
 # STEP 8: Simulation is independent of the terminal renderer.
 class RainSimulation:
-    def __init__(self, columns, rows, glyphs, seed=None):
+    def __init__(self, columns, rows, glyphs, seed=None, glyph_sets=None):
         self.columns, self.rows = columns, rows
         self.glyphs = glyphs
+        self.glyph_sets = glyph_sets or ('kanji', 'hiragana', 'katakana', 'ascii')
+        self.symbol_indexes = tuple(
+            index for index, name in enumerate(('kanji', 'hiragana', 'katakana', 'ascii'))
+            if name in self.glyph_sets)
         self.seed = seed if seed is not None else 0
         self.drops = [[] for _ in range(columns)]
         self.process_drops = {}
@@ -329,6 +344,7 @@ class RainSimulation:
         self.started_columns = set()
         self.column_wait = [0.0] * columns
         self.clock_ticks = os.sysconf('SC_CLK_TCK')
+        self.previous_switches = None
 
     def resize(self, columns, rows):
         """Adapt to terminal resize without resetting active animation."""
@@ -366,6 +382,9 @@ class RainSimulation:
         memory_part = min(6, int(math.log2(process.rss_pages + 1) / 2))
         thread_part = min(3, int(math.log2(max(1, process.threads))))
         return min(16, SEMANTIC_SLOTS + memory_part + thread_part)
+
+    def _variants(self, key):
+        return tuple(SYMBOLS[key][index] for index in self.symbol_indexes)
 
     def _adjust_length(self, drop, process, elapsed):
         """Move toward a memory/thread/activity target one tail cell at a time."""
@@ -407,7 +426,7 @@ class RainSimulation:
         drop.scheduler_events = 0
         if score == 0:
             key = '静'
-        drop.glyphs.insert(SEMANTIC_SLOTS, drop.symbol_rng.choice(SYMBOLS[key]))
+        drop.glyphs.insert(SEMANTIC_SLOTS, drop.symbol_rng.choice(self._variants(key)))
         drop.glyphs.pop()  # Oldest sample falls off the far end.
 
     def _semantic_glyphs(self, process, elapsed, pressure):
@@ -431,38 +450,49 @@ class RainSimulation:
                   'memory': '憶', 'io': '入'}[pressure]
         return [state, cpu_glyph, memory, io, threads, system]
 
-    def _update_symbols(self, drop, keys):
+    def _update_symbols(self, drop, keys, levels, switch_delta):
         if drop.symbol_rng is None:
             payload = f'symbols:{drop.process.pid}:{drop.process.start_time}:{self.seed}'.encode('ascii')
             value = int.from_bytes(hashlib.blake2s(payload, digest_size=8).digest(), 'big')
             drop.symbol_rng = random.Random(value)
+            drop.symbol_offsets = [drop.symbol_rng.randrange(len(self.symbol_indexes))
+                                   for _ in range(SEMANTIC_SLOTS)]
             drop.semantic_keys = list(keys)
-            drop.change_times = [drop.symbol_rng.uniform(0.5, 2.5)
-                                 for _ in range(SEMANTIC_SLOTS)]
-            for i, key in enumerate(keys):
-                drop.glyphs[i] = drop.symbol_rng.choice(SYMBOLS[key])
-            return
+            drop.previous_levels = tuple(levels)
+            drop.heartbeat_progress = [0] * SEMANTIC_SLOTS
+            drop.heartbeat_cadences = []
+            for i in range(SEMANTIC_SLOTS):
+                cadence_key = f'{drop.process.pid}:{drop.process.start_time}:{i}:{self.seed}'.encode('ascii')
+                cadence_hash = hashlib.blake2s(cadence_key, digest_size=4).digest()
+                drop.heartbeat_cadences.append(
+                    8_000 + int.from_bytes(cadence_hash, 'big') % 24_000)
         for i, key in enumerate(keys):
-            if key != drop.semantic_keys[i]:
-                drop.semantic_keys[i] = key
-                drop.glyphs[i] = drop.symbol_rng.choice(SYMBOLS[key])
-                drop.change_times[i] = drop.symbol_rng.uniform(0.5, 2.5)
-
-    def _animate_symbols(self, drop, dt):
-        for i, key in enumerate(drop.semantic_keys):
-            drop.change_times[i] -= dt
-            if drop.change_times[i] <= 0:
-                choices = [glyph for glyph in SYMBOLS[key] if glyph != drop.glyphs[i]]
-                drop.glyphs[i] = drop.symbol_rng.choice(choices)
-                drop.change_times[i] = drop.symbol_rng.uniform(0.5, 2.5)
+            # The per-process counter gets first claim on a form change.
+            # System context switches supply a slower, process-specific pulse
+            # when that local counter has not moved.
+            if drop.previous_levels[i] != levels[i] or drop.semantic_keys[i] != key:
+                drop.symbol_offsets[i] = (drop.symbol_offsets[i] + 1) % len(self.symbol_indexes)
+                drop.heartbeat_progress[i] = 0
+            elif switch_delta:
+                cadence = drop.heartbeat_cadences[i]
+                drop.heartbeat_progress[i] += switch_delta
+                if drop.heartbeat_progress[i] >= cadence:
+                    drop.symbol_offsets[i] = (drop.symbol_offsets[i] + 1) % len(self.symbol_indexes)
+                    drop.heartbeat_progress[i] %= cadence
+            drop.semantic_keys[i] = key
+            drop.glyphs[i] = self._variants(key)[drop.symbol_offsets[i]]
+        drop.previous_levels = tuple(levels)
 
     def _startup_delay(self, identity):
         payload = f'start:{identity[0]}:{identity[1]}:{self.seed}'.encode('ascii')
         value = int.from_bytes(hashlib.blake2s(payload, digest_size=8).digest(), 'big')
         return (value / (2**64 - 1)) * self.startup_duration
 
-    def sync_processes(self, processes, elapsed, pressure=None):
+    def sync_processes(self, processes, elapsed, pressure=None, switches=None):
         """Track every process while keeping each column's queue stable."""
+        switch_delta = (max(0, switches - self.previous_switches)
+                        if switches is not None and self.previous_switches is not None else 0)
+        self.previous_switches = switches
         current = sorted(processes.values(), key=lambda process: process.identity)
         live = {process.identity for process in current}
         for identity, drop in self.process_drops.items():
@@ -483,7 +513,21 @@ class RainSimulation:
                 drop.process = process
                 drop.active = True
                 drop.fade = 1.0
-            self._update_symbols(drop, self._semantic_glyphs(process, elapsed, pressure))
+            pressure_label, pressure_total = pressure if isinstance(pressure, tuple) else (pressure, 0)
+            keys = self._semantic_glyphs(process, elapsed, pressure_label)
+            if drop.semantic_keys is not None and keys[0] != drop.semantic_keys[0]:
+                drop.state_transitions += 1
+            drop.memory_movement += abs(process.memory_delta)
+            drop.thread_movement += abs(process.thread_delta)
+            levels = (
+                drop.state_transitions + drop.scheduler_total // 8,
+                process.cpu_ticks // max(1, round(self.clock_ticks / 10)),
+                drop.memory_movement // 16,
+                ((process.read_bytes or 0) + (process.write_bytes or 0)) // 65_536,
+                drop.thread_movement,
+                pressure_total // 1_000_000,
+            )
+            self._update_symbols(drop, keys, levels, switch_delta)
             self._adjust_length(drop, process, elapsed)
             self._record_history(drop, process, elapsed)
             # /proc CPU time is in clock ticks; use it to control motion.
@@ -505,7 +549,6 @@ class RainSimulation:
                     continue
                 drop.entered = True
             drop.head += drop.speed * dt
-            self._animate_symbols(drop, dt)
             if not drop.active:
                 drop.fade *= math.exp(-dt / 0.8)
                 # A process that exited while waiting still gets one brief
@@ -532,6 +575,7 @@ class RainSimulation:
             if drop is None or not drop.active:
                 continue
             drop.scheduler_events += 1
+            drop.scheduler_total += 1
 
     def pixels(self):
         """Return grid[row][column] = (glyph, brightness tier 0..3)."""
@@ -639,7 +683,8 @@ def run(stdscr, args):
                              (3, curses.COLOR_WHITE)):
             curses.init_pair(tier, colour, -1)
 
-    glyphs = ''.join(GLYPHS[name] for name in args.glyphs.split(','))
+    glyph_names = args.glyphs.split(',')
+    glyphs = ''.join(GLYPHS[name] for name in glyph_names)
     # --fill maps two terminal character cells to one LED column and
     # reserves two lines for telemetry and controls. Leave the last terminal
     # cell unused to avoid bottom-right curses drawing edge cases.
@@ -648,7 +693,7 @@ def run(stdscr, args):
         return max(1, (width - 1) // 2), max(1, height - 2)
 
     columns, rows = terminal_grid() if args.fill else (args.columns, args.rows)
-    rain = RainSimulation(columns, rows, glyphs, args.seed)
+    rain = RainSimulation(columns, rows, glyphs, args.seed, glyph_names)
     telemetry = LinuxTelemetry()
     processes = LinuxProcesses()
     collector = None
@@ -684,7 +729,9 @@ def run(stdscr, args):
             try:
                 telemetry.sample()
                 process_snapshot = processes.sample(include_threads=collector is not None)
-                rain.sync_processes(process_snapshot, args.poll, read_system_pressure())
+                if not paused:
+                    rain.sync_processes(process_snapshot, processes.elapsed,
+                                        read_system_pressure(), telemetry.previous['switches'])
             except (OSError, ValueError, IndexError):
                 pass  # Keep rendering if a transient procfs read fails.
             next_poll = frame_start + args.poll

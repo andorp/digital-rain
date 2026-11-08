@@ -1,6 +1,6 @@
 # Kernel Rain
 
-A Linux-only, standard-library Python curses simulator of a 30-column × 60-pixel green LED rain wall. Visible drops represent real processes discovered through read-only `/proc`. Process identity deterministically selects a trail, CPU activity controls its speed, and memory/thread state affects its length. No root privileges, eBPF, or third-party packages are required for the default mode.
+A Linux-only, standard-library Python curses simulator of a 30-column × 60-pixel green LED rain wall. Drops represent processes discovered through read-only `/proc`. CPU activity controls speed; memory, threads, and sustained activity control length. Current process measurements fill the six characters nearest the head, and recent activity fills the rest. No root privileges, eBPF, or third-party packages are required for the default mode.
 
 ## Run
 
@@ -13,14 +13,14 @@ Use a terminal with a Japanese-capable monospace font, at least 60 columns and i
 
 ```bash
 python3 kernel_rain.py --glyphs katakana,hiragana,kanji,ascii --fps 30
-python3 kernel_rain.py --glyphs ascii  # identity artwork only; semantic positions remain kanji
+python3 kernel_rain.py --glyphs ascii  # use ASCII variants for all positions
 ```
 
-Controls: `q` or Escape quits, Space pauses, `r` resets adaptive baselines.
+Controls: `q` or Escape quits, Space freezes the picture, `r` resets adaptive baselines and process sampling. Collection continues during a pause; observations made while paused are not replayed.
 
 ## Mapping
 
-Every discovered process has a drop, assigned to a column with the fewest queued processes. Each column shows one stream at a time and cycles through its queue as streams finish. Initial column entries are staggered, and a short gap separates successive streams. A process receives a stable column and a trail whose first six kanji encode sampled measurements; the rest identify the process. A terminated process that is already visible continues falling and fades; a live process returns to its column queue after reaching the bottom. The status line also reports aggregate CPU, context-switch, fork, disk and network activity.
+Every discovered process has a drop, assigned to a column with the fewest queued processes. Each column shows one stream at a time and cycles through its queue as streams finish. Initial column entries are staggered, and a short gap separates successive streams. A terminated process eventually gets one fading pass; a live process returns to its column queue after reaching the bottom. The status line reports aggregate CPU, context-switch, fork, disk and network activity.
 
 ## Caveats
 
@@ -29,8 +29,8 @@ Every discovered process has a drop, assigned to a column with the fewest queued
 ## Process-backed visualisation
 
 Each drop is backed by a `(PID, process start time)` identity, so PID reuse does
-not accidentally continue an old process's visual stream. The first visual
-phase gives the six characters nearest the bright head fixed meanings. Read
+not accidentally continue an old process's visual stream. The six characters
+nearest the bright head have fixed meanings. Read
 from the head backwards:
 
 | Position | Meaning | Kanji |
@@ -42,12 +42,19 @@ from the head backwards:
 | 5 | Thread count change | `増` increased, `減` decreased, `定` unchanged |
 | 6 | Strongest system-wide pressure over 10 seconds | `静` below 5%, `算` CPU, `憶` memory, `入` I/O, `不` unavailable |
 
-Each meaning has kanji, hiragana, katakana and ASCII variants. A seeded
-per-process generator chooses a variant and periodically switches to another
-variant while the meaning stays the same. Kana are one-character reading cues and ASCII is a
-mnemonic for the position; consult the position first when interpreting one.
-Use `--seed` to repeat a sequence with the same process observations and
-frame timing. The characters beyond the six current-state positions record
+Each meaning has kanji, hiragana, katakana and ASCII variants. `--glyphs`
+selects which scripts are allowed; selecting only one script removes script
+rotation. A process's
+identity and `--seed` select each position's initial form. Its form advances
+when a relevant measured counter crosses a step: state changes or eight
+scheduler events, 0.1 CPU-seconds, 16 pages of cumulative memory movement,
+64 KiB of storage I/O, a thread-count change, or one second of accumulated
+system stall time, respectively. When a local counter stays still, aggregate
+kernel context switches provide a slower pulse. Each process and position has
+a seeded cadence of 8,000–31,999 switches, so quiet drops also change form
+without changing meaning. Kana are one-character reading cues and ASCII is a mnemonic
+for the position; consult the position first when interpreting one.
+The characters beyond the six current-state positions record
 recent process activity, newest first. Each `/proc` sample adds one character:
 
 | Activity selected from a sample | Kanji |
@@ -78,6 +85,48 @@ With more processes than columns, each process appears in turn rather than all
 at once. The display remains an intuition-building view rather than an exact
 process monitor.
 
+## Follow one process through the program
+
+1. `read_process_table()` reads `/proc/<pid>/stat` for process state, CPU ticks,
+   resident pages, thread count and start time. It also attempts to read
+   `/proc/<pid>/io`. If I/O counters are inaccessible, the I/O position uses
+   the unknown symbol. `(PID, start time)` identifies a process across samples:
+   a reused PID creates a different drop.
+2. `LinuxProcesses.sample()` compares this table with the previous one. It
+   calculates changes in CPU ticks, resident pages, thread count, and read and
+   write bytes. The elapsed time is measured with a monotonic clock, so a slow
+   sample does not pretend it took exactly `--poll` seconds. Separate global
+   telemetry supplies status-line rates and a cumulative context-switch count;
+   `/proc/pressure` supplies CPU, memory and I/O stall information.
+3. `RainSimulation.sync_processes()` creates a drop for a new process. It puts
+   the drop in a least-populated column queue. Only the front process in each
+   queue is drawn. Its bright head starts above the screen at row `-1`.
+4. Six fixed positions behind the head describe the *latest* sample. For
+   instance, `眠 低 定 読 定 静` means sleeping, low recent CPU use, stable
+   resident memory, storage reads, stable thread count, and low system
+   pressure. This is an illustrative kanji-only reading: with the default
+   glyph selection each position may instead show a kana or ASCII equivalent.
+   The pressure position describes the whole system, not this process alone.
+5. The remaining positions are a short history. At each sample, the strongest
+   classified activity enters immediately after position six. Existing history
+   shifts toward the far end and the oldest observation drops away. Each
+   history symbol keeps its chosen form. Tail length responds gradually to
+   resident memory, threads, and sustained CPU or storage activity, from six
+   to sixteen positions. CPU use also raises falling speed above the minimum
+   eight rows per second.
+6. The first six symbols may rotate among forms while their meaning stays
+   fixed. Their own counters take priority. If a local counter is still, the
+   global context-switch counter can advance its form at a different seeded
+   cadence for each process and position. This produces motion in quiet drops
+   without changing their measured category. A fixed seed gives repeatable
+   choices when the observations and sampling sequence are the same.
+7. `step()` moves the head down with elapsed frame time, and `pixels()` places
+   each glyph at `int(head) - distance`. The head is bright; older positions
+   are dimmer. A live process goes to the back of its column queue after its
+   tail clears the bottom. A process that exited gets a fading pass and is
+   then removed. The renderer displays the grid in curses; it does not decide
+   what the glyphs mean.
+
 ## Real scheduler events via eBPF (optional)
 
 The tutorial now has two data sources:
@@ -86,7 +135,7 @@ The tutorial now has two data sources:
 python3 kernel_rain.py --source proc    # no special permissions
 ```
 
-For true per-event mutation, install BCC and run with the required kernel tracing privileges. On Ubuntu/Debian, the BCC package is commonly `python3-bpfcc`; depending on distribution, its Python module may be installed for `/usr/bin/python3` rather than a virtual environment:
+For scheduler-event observations, install BCC and run with the required kernel tracing privileges. On Ubuntu/Debian, the BCC package is commonly `python3-bpfcc`; depending on distribution, its Python module may be installed for `/usr/bin/python3` rather than a virtual environment:
 
 ```bash
 sudo apt update
@@ -102,7 +151,7 @@ Kernel headers package availability depends on the installed kernel; BCC may wor
 
 `--source proc` remains the default for compatibility and as a fallback. If BCC is missing or tracepoint attachment is denied, eBPF mode reports an error instead of silently claiming to show real scheduler events.
 
-Note: the visual mapping is not a lossless event log; events may be dropped under load, and a busy kernel can update the same character multiple times in a single frame. This is a teaching implementation; production installations should aggregate events in eBPF maps to reduce overhead.
+Note: the visual mapping is not a lossless event log; events may be dropped under load, and multiple scheduling events can contribute to one sampled history symbol. This is a teaching implementation; production installations should aggregate events in eBPF maps to reduce overhead.
 
 ## Fill the terminal automatically
 
