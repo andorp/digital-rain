@@ -116,6 +116,36 @@ def read_kernel_counters():
     return result
 
 
+def read_cpu_temperature():
+    """Read a CPU hwmon sensor in Celsius; return (label, value) or None."""
+    for sensor in sorted(Path('/sys/class/hwmon').glob('hwmon*')):
+        try:
+            driver = (sensor / 'name').read_text(encoding='ascii').strip()
+        except OSError:
+            continue
+        if driver not in ('k10temp', 'coretemp', 'zenpower'):
+            continue
+        candidates = []
+        for path in sensor.glob('temp*_input'):
+            try:
+                label = path.with_name(path.name.replace('_input', '_label'))
+                name = label.read_text(encoding='ascii').strip() if label.exists() else ''
+                priority = (0 if name == 'Tdie' else
+                            1 if name == 'Tctl' else
+                            2 if name.startswith('Package id') else 3)
+                candidates.append((priority, path.name, name, path))
+            except OSError:
+                continue
+        for _, _, name, path in sorted(candidates):
+            try:
+                value = int(path.read_text(encoding='ascii').strip()) / 1000.0
+                if -20.0 <= value <= 150.0:
+                    return name or driver, value
+            except (OSError, ValueError):
+                continue
+    return None
+
+
 # STEP 4: Learn what 'normal' looks like.
 # An exponentially weighted moving mean adapts to your machine over time.
 # A fixed threshold (e.g. 10 MB/s) is poor because different computers and
@@ -149,6 +179,7 @@ class LinuxTelemetry:
         self.rates = {key: 0.0 for key in CHANNELS[1:]}
         self.event_data = {key: (0, 0) for key in CHANNELS}
         self.sample_index = 0
+        self.cpu_temperature = read_cpu_temperature()
 
     def sample(self):
         current = read_kernel_counters()
@@ -168,6 +199,7 @@ class LinuxTelemetry:
             # log1p compresses spikes (e.g. compilation or large downloads).
             self.intensity[key] = baseline.observe(math.log1p(rate), dt)
         self.previous, self.previous_time = current, now
+        self.cpu_temperature = read_cpu_temperature()
 
 
 # STEP 6: Read the process table. A process identity includes its start time
@@ -362,6 +394,26 @@ class RainSimulation:
                 self.process_columns[drop.process.identity] = target
         self.column_wait = (self.column_wait + [0.0] * columns)[:columns]
         self.started_columns = {x for x in self.started_columns if x < columns}
+        if columns > len(old):
+            # Move queued streams into new columns while keeping visible
+            # streams in place. A newly occupied column can start at once.
+            while True:
+                source = max(range(columns), key=lambda x: len(self.drops[x]))
+                target = min(range(columns), key=lambda x: len(self.drops[x]))
+                if len(self.drops[source]) - len(self.drops[target]) <= 1:
+                    break
+                queue = self.drops[source]
+                index = next((i for i in range(len(queue) - 1, 0, -1)
+                              if queue[i].active), len(queue) - 1)
+                drop = queue.pop(index)
+                drop.entered = False
+                drop.head = -1.0
+                empty = not self.drops[target]
+                self.drops[target].append(drop)
+                self.process_columns[drop.process.identity] = target
+                if empty:
+                    self.column_wait[target] = 0.0
+                    self.started_columns.add(target)
         self.columns, self.rows = columns, rows
 
     def _column_for(self, identity):
@@ -553,7 +605,7 @@ class RainSimulation:
                 drop.fade *= math.exp(-dt / 0.8)
                 # A process that exited while waiting still gets one brief
                 # visible pass; fading begins when it enters the column.
-            if drop.head - drop.length >= self.rows:
+            if drop.head - drop.length >= self.rows or (not drop.active and drop.fade < 0.25):
                 queue.pop(0)
                 if drop.active:
                     drop.head = -1.0
@@ -641,7 +693,10 @@ def draw(stdscr, simulation, telemetry, paused, ebpf_status=""):
     active_processes = sum(
         1 for drop in simulation.process_drops.values() if drop.active
     )
-    info = (f'CPU {telemetry.intensity["cpu"]*100:3.0f}% | '
+    temperature = telemetry.cpu_temperature
+    temperature_text = (f'{temperature[0]} {temperature[1]:.0f}°C'
+                        if temperature is not None else 'temp n/a')
+    info = (f'CPU {telemetry.intensity["cpu"]*100:3.0f}% {temperature_text} | '
             f'proc {active_processes:3d} | '
             f'switch {telemetry.rates["switches"]:,.0f}/s | '
             f'fork {telemetry.rates["forks"]:,.0f}/s | '

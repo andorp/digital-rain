@@ -20,7 +20,14 @@ Controls: `q` or Escape quits, Space freezes the picture, `r` resets adaptive ba
 
 ## Mapping
 
-Every discovered process has a drop, assigned to a column with the fewest queued processes. Each column shows one stream at a time and cycles through its queue as streams finish. Initial column entries are staggered, and a short gap separates successive streams. A terminated process eventually gets one fading pass; a live process returns to its column queue after reaching the bottom. The status line reports aggregate CPU, context-switch, fork, disk and network activity.
+Every discovered process has a drop, assigned to a column with the fewest queued processes. Each column shows one stream at a time and cycles through its queue as streams finish. Initial column entries are staggered, and a short gap separates successive streams. A terminated process fades until invisible, then releases its column; a live process returns to its column queue after reaching the bottom. The status line reports aggregate CPU, context-switch, fork, disk and network activity.
+
+The status line also shows CPU temperature from a recognized Linux hwmon
+sensor (`k10temp`, `coretemp`, or `zenpower`). It prefers `Tdie`, then `Tctl`,
+then a package sensor, and displays the sensor label alongside °C. `Tctl` is
+the control-temperature reading exposed by the driver. If no CPU sensor is
+available, it shows `temp n/a`. Temperature is sampled with the other
+telemetry; it does not currently affect the drops.
 
 ## Caveats
 
@@ -123,8 +130,8 @@ process monitor.
 7. `step()` moves the head down with elapsed frame time, and `pixels()` places
    each glyph at `int(head) - distance`. The head is bright; older positions
    are dimmer. A live process goes to the back of its column queue after its
-   tail clears the bottom. A process that exited gets a fading pass and is
-   then removed. The renderer displays the grid in curses; it does not decide
+   tail clears the bottom. A process that exited is removed once it fades
+   from view. The renderer displays the grid in curses; it does not decide
    what the glyphs mean.
 
 ## Real scheduler events via eBPF (optional)
