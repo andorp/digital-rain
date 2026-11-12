@@ -1,2 +1,4 @@
 /kernel_rain_baseline
 /kernel_rain_optimized
+/kernel_rain_hand
+/hand_optimized.o

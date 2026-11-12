@@ -1,5 +1,8 @@
 # Optimization log: from C to x86-64 assembly
 
+For the later hand-edited assembly pass, see
+[`HAND_OPTIMIZATION_LOG.md`](HAND_OPTIMIZATION_LOG.md).
+
 This tutorial records an experiment, including an attempted change that did
 not show a reliable gain. The goal is to make the reasoning reproducible;
 "optimized" means faster on the measured process-sync workload, not a claim
