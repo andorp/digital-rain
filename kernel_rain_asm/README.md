@@ -6,8 +6,8 @@ It contains both the C inputs and GCC `-O3` assembly outputs:
 | File | Purpose |
 |---|---|
 | `main.c`, `baseline.s` | Original C algorithm and its optimized GCC assembly |
-| `main_optimized.c`, `optimized.s` | Indexed process lookup and its optimized GCC assembly |
-| `hand_optimized.s` | Further hand-edited assembly, assembled with `as` and linked with `ld` |
+| `main_optimized.c`, `optimized.s` | Indexed lookup, C-level hot-path changes, and their GCC `-O3` assembly |
+| `hand_optimized.s` | Further hand-edited assembly from the current `optimized.s`, assembled with `as` and linked with `ld` |
 | `OPTIMIZATION_LOG.md` | Reproducible experiment and explanation |
 | `HAND_OPTIMIZATION_LOG.md` | Notes and measurements for the hand edit |
 

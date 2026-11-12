@@ -647,8 +647,21 @@ static void rain_destroy(Rain *rain) {
 }
 
 static int trail_length(const Process *p) {
-    int memory = (int)(log2((double)p->rss_pages + 1.0) / 2.0);
-    int threads = (int)log2((double)(p->threads > 0 ? p->threads : 1));
+    /* The result only needs the integer part of two binary logarithms.
+     * Keep libm for enormous counters, where double rounding near a power
+     * of two can differ from an integer bit scan. */
+    int memory, threads;
+    if (p->rss_pages >= 0 && (uint64_t)p->rss_pages < (UINT64_C(1) << 40)) {
+        uint64_t pages = (uint64_t)p->rss_pages + 1;
+        memory = (63 - __builtin_clzll(pages)) / 2;
+    } else {
+        memory = (int)(log2((double)p->rss_pages + 1.0) / 2.0);
+    }
+    long count = p->threads > 0 ? p->threads : 1;
+    if ((uint64_t)count < (UINT64_C(1) << 40))
+        threads = 63 - __builtin_clzll((uint64_t)count);
+    else
+        threads = (int)log2((double)count);
     if (memory > 6) memory = 6;
     if (threads > 3) threads = 3;
     int length = SEMANTIC + memory + threads;
@@ -732,7 +745,7 @@ static void rain_resize(Rain *rain, int width, int height) {
 /* STEP 6: Project process measurements into six current-state meanings and
  * a history symbol. CPU fraction is relative to ONE core, as in the Python
  * tutorial. A multithreaded process may use more than one core. */
-static void semantic_keys(const Rain *rain, const Process *p, double elapsed,
+static void semantic_keys(const Process *p, double cpu,
                           Pressure pressure, int keys[SEMANTIC]) {
     switch (p->state) {
         case 'R': keys[0] = RUN; break;
@@ -742,7 +755,6 @@ static void semantic_keys(const Rain *rain, const Process *p, double elapsed,
         case 'Z': case 'X': keys[0] = ZOMBIE; break;
         default: keys[0] = UNKNOWN;
     }
-    double cpu = (double)p->cpu_delta / fmax(elapsed * (double)rain->clock_ticks, 0.001);
     keys[1] = cpu < 0.01 ? QUIET : cpu < 0.1 ? LOW : cpu < 0.5 ? MEDIUM : HIGH;
     keys[2] = p->memory_delta > 16 ? GROW :
               p->memory_delta < -16 ? SHRINK : STEADY;
@@ -758,8 +770,8 @@ static void semantic_keys(const Rain *rain, const Process *p, double elapsed,
 }
 
 static void update_semantics(Drop *drop, const Rain *rain, const int keys[SEMANTIC],
-                             const uint64_t levels[SEMANTIC], uint64_t switches) {
-    int forms = variants(rain->glyph_mask);
+                             const uint64_t levels[SEMANTIC], uint64_t switches,
+                             int forms) {
     if (!drop->symbols_ready) {
         drop->symbols_ready = 1;
         for (int i = 0; i < SEMANTIC; i++) {
@@ -779,7 +791,12 @@ static void update_semantics(Drop *drop, const Rain *rain, const int keys[SEMANT
             drop->heartbeat[i] += switches;
             if (drop->heartbeat[i] >= drop->cadence[i]) {
                 drop->offsets[i] = (drop->offsets[i] + 1) % forms;
-                drop->heartbeat[i] %= drop->cadence[i];
+                /* A usual sample crosses at most one cadence. Preserve the
+                 * modulo path for unusually large switch bursts. */
+                if (drop->heartbeat[i] < 2 * drop->cadence[i])
+                    drop->heartbeat[i] -= drop->cadence[i];
+                else
+                    drop->heartbeat[i] %= drop->cadence[i];
             }
         }
         drop->keys[i] = keys[i];
@@ -788,13 +805,16 @@ static void update_semantics(Drop *drop, const Rain *rain, const int keys[SEMANT
     }
 }
 
-static void adjust_length(Drop *drop, const Rain *rain, double elapsed) {
+/* This helper is used once per process per sample. Inlining lets the caller
+ * retain the sample-wide constants and avoids a call in the hot loop. */
+static inline __attribute__((always_inline)) void
+adjust_length(Drop *drop, double elapsed, double cpu,
+              double io_elapsed, double alpha) {
     const Process *p = &drop->process;
-    double cpu = clamp((double)p->cpu_delta /
-        fmax(elapsed * (double)rain->clock_ticks, 0.001), 0, 1);
-    double io = clamp(log1p((double)(p->read_delta + p->write_delta) /
-        fmax(elapsed, 0.001)) / log1p(1000000.0), 0, 1);
-    double alpha = 1.0 - exp(-elapsed / 4.0);
+    uint64_t io_delta = p->read_delta + p->write_delta;
+    double io = io_delta ? clamp(log1p((double)io_delta / io_elapsed) /
+                                 log1p(1000000.0), 0, 1) : 0;
+    cpu = clamp(cpu, 0, 1);
     drop->sustained += alpha * (fmax(cpu, io) - drop->sustained);
     int target = trail_length(p) + (int)round(3.0 * drop->sustained);
     if (target > MAX_TRAIL) target = MAX_TRAIL;
@@ -805,7 +825,8 @@ static void adjust_length(Drop *drop, const Rain *rain, double elapsed) {
     else drop->glyph[--drop->length] = " ";
 }
 
-static void record_history(Drop *drop, const Rain *rain, double elapsed) {
+static void record_history(Drop *drop, const Rain *rain, double elapsed,
+                           double cpu, int forms) {
     if (drop->length <= SEMANTIC) return;
     const Process *p = &drop->process;
     double score = 0, candidate;
@@ -814,7 +835,6 @@ static void record_history(Drop *drop, const Rain *rain, double elapsed) {
     candidate = (value); \
     if (candidate > score) { score = candidate; key = (meaning); } \
 } while (0)
-    double cpu = (double)p->cpu_delta / fmax(elapsed * (double)rain->clock_ticks, 0.001);
     CONSIDER(cpu >= 0.01 ? cpu : 0, COMPUTE);
     CONSIDER(clamp((double)p->read_delta / elapsed / 1000000.0, 0, 1), READ);
     CONSIDER(clamp((double)p->write_delta / elapsed / 1000000.0, 0, 1), WRITE);
@@ -826,7 +846,7 @@ static void record_history(Drop *drop, const Rain *rain, double elapsed) {
     for (int i = drop->length - 1; i > SEMANTIC; i--)
         drop->glyph[i] = drop->glyph[i - 1];
     drop->glyph[SEMANTIC] = symbol_form(key, rain->glyph_mask,
-        (int)(next_random(&drop->rng) % (uint64_t)variants(rain->glyph_mask)));
+        (int)(next_random(&drop->rng) % (uint64_t)forms));
 }
 
 static void rain_sync(Rain *rain, const ProcessTable *table, double elapsed,
@@ -835,6 +855,16 @@ static void rain_sync(Rain *rain, const ProcessTable *table, double elapsed,
                             switches - rain->previous_switches : 0;
     rain->previous_switches = switches;
     rain->have_switches = 1;
+    /* These values are fixed for the whole sample, independent of how many
+     * processes it contains. The CPU ratio itself is reused four times for
+     * each process below. */
+    uint64_t cpu_step = (uint64_t)lround((double)rain->clock_ticks / 10.0);
+    if (!cpu_step) cpu_step = 1;
+    double cpu_denominator = fmax(elapsed * (double)rain->clock_ticks, 0.001);
+    double io_elapsed = fmax(elapsed, 0.001);
+    double alpha = 1.0 - exp(-elapsed / 4.0);
+    int forms = variants(rain->glyph_mask);
+    uint64_t pressure_level = pressure.total / 1000000;
     for (Drop *drop = rain->all; drop; drop = drop->all_next) drop->active = 0;
     for (size_t i = 0; i < table->count; i++) {
         const Process *p = &table->items[i];
@@ -857,27 +887,24 @@ static void rain_sync(Rain *rain, const ProcessTable *table, double elapsed,
             drop->fade = 1;
         }
         drop->active = 1;
+        double cpu = (double)p->cpu_delta / cpu_denominator;
         int keys[SEMANTIC];
-        semantic_keys(rain, p, elapsed, pressure.kind, keys);
+        semantic_keys(p, cpu, pressure.kind, keys);
         if (drop->symbols_ready && keys[0] != drop->keys[0]) drop->state_changes++;
         drop->memory_movement += (uint64_t)labs(p->memory_delta);
         drop->thread_movement += (uint64_t)labs(p->thread_delta);
-        uint64_t cpu_step = (uint64_t)lround((double)rain->clock_ticks / 10.0);
-        if (!cpu_step) cpu_step = 1;
         uint64_t levels[SEMANTIC] = {
             drop->state_changes,
             p->cpu_ticks / cpu_step,
             drop->memory_movement / 16,
             (p->read_bytes + p->write_bytes) / 65536,
             drop->thread_movement,
-            pressure.total / 1000000
+            pressure_level
         };
-        update_semantics(drop, rain, keys, levels, switch_delta);
-        adjust_length(drop, rain, elapsed);
-        record_history(drop, rain, elapsed);
-        double rate = (double)p->cpu_delta /
-            fmax(elapsed * (double)rain->clock_ticks, 0.001);
-        drop->speed = 8.0 + 12.0 * clamp(rate, 0, 1);
+        update_semantics(drop, rain, keys, levels, switch_delta, forms);
+        adjust_length(drop, elapsed, cpu, io_elapsed, alpha);
+        record_history(drop, rain, elapsed, cpu, forms);
+        drop->speed = 8.0 + 12.0 * clamp(cpu, 0, 1);
     }
 }
 

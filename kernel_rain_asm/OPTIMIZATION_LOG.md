@@ -112,3 +112,27 @@ them on your machine and compare medians. To try another idea, edit
 `main_optimized.c`, run `make optimized.s kernel_rain_optimized`, and compare
 again. If you hand-edit `optimized.s`, save that patch separately: `make` will
 regenerate the file whenever its C input is newer.
+
+## 6. Move repeated process work into C
+
+The next round changed `main_optimized.c` before regenerating `optimized.s`.
+The sync loop now calculates sample-wide values once: the rounded tick step,
+elapsed-time floors, exponential decay factor, form count, and pressure
+level. It calculates each process's CPU fraction once, then reuses it in
+classification, trail length, history selection, and animation speed.
+For the usual counter range, `__builtin_clzll` gives the integer part of
+the two length logarithms; enormous values retain the old `log2` path.
+Zero I/O avoids `log1p(0)`. A heartbeat that crosses only one cadence uses
+subtraction, with modulo preserved for larger bursts.
+
+These are source-level changes because the same values were being recomputed
+across several helpers. The corresponding new `optimized.s` was compiled
+with the same `-O3` options shown above. GCC initially left `adjust_length`
+as a separate function, making the sync benchmark slower. Marking the helper
+`always_inline` restored the in-loop code before the hand assembly pass.
+That attribute and `__builtin_clzll` make this optimized C copy GCC-specific;
+the original C tutorial in `kernel_rain_c/` remains independent.
+
+The fresh hand-assembly changes and paired timings are in
+[`HAND_OPTIMIZATION_LOG.md`](HAND_OPTIMIZATION_LOG.md). The measured workload
+still excludes procfs reads and ncurses drawing.
